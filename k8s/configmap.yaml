@@ -1,0 +1,133 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gruvit-config
+  namespace: gruvit
+data:
+  # Database Configuration
+  MONGO_URI: "mongodb://mongo-service:27017"
+  REDIS_ADDR: "redis-service:6379"
+  
+  # Server Configuration
+  PORT: "8080"
+  NODE_ENV: "production"
+  
+  # CORS Configuration
+  CORS_ORIGINS: "https://gruvit.com,https://www.gruvit.com"
+  
+  # Rate Limiting
+  RATE_LIMIT_SEARCH: "60"
+  RATE_LIMIT_STREAM: "30"
+  RATE_LIMIT_PLAYLIST: "20"
+  RATE_LIMIT_AUTH: "10"
+  
+  # JWT Configuration
+  JWT_EXPIRATION: "86400"
+  JWT_REFRESH_EXPIRATION: "604800"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nginx-config
+  namespace: gruvit
+data:
+  nginx.conf: |
+    events {
+        worker_connections 1024;
+    }
+    http {
+        include       /etc/nginx/mime.types;
+        default_type  application/octet-stream;
+        log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                        '$status $body_bytes_sent "$http_referer" '
+                        '"$http_user_agent" "$http_x_forwarded_for"';
+        access_log /var/log/nginx/access.log main;
+        error_log /var/log/nginx/error.log;
+        limit_req_zone $binary_remote_addr zone=api:10m rate=10r/s;
+        limit_req_zone $binary_remote_addr zone=auth:10m rate=5r/s;
+        upstream auth_service { server java-service:8080; keepalive 32; }
+        upstream music_service { server go-service:8080; keepalive 32; }
+        upstream frontend { server frontend:3000; keepalive 32; }
+        server {
+            listen 80;
+            server_name _;
+            add_header X-Frame-Options DENY;
+            add_header X-Content-Type-Options nosniff;
+            add_header X-XSS-Protection "1; mode=block";
+            add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+            # CORS and security headers
+            set $cors_origin "";
+            if ($http_origin ~* "^https?://(localhost(:[0-9]+)?|gruvit\\.com|www\\.gruvit\\.com)$") { set $cors_origin $http_origin; }
+            add_header Access-Control-Allow-Origin $cors_origin always;
+            add_header Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS" always;
+            add_header Access-Control-Allow-Headers "Origin, Content-Type, Accept, Authorization" always;
+            add_header Access-Control-Allow-Credentials true always;
+            add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+            add_header Permissions-Policy "autoplay=(), camera=(), microphone=(), geolocation=()" always;
+            add_header Cross-Origin-Opener-Policy "same-origin" always;
+            add_header Cross-Origin-Embedder-Policy "require-corp" always;
+
+            location / {
+                proxy_pass http://frontend;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+            location ~* ^/(api/)?auth/ {
+                limit_req zone=auth burst=10 nodelay;
+                proxy_pass http://auth_service/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header Authorization $http_authorization;
+            }
+            location /api/music/ {
+                limit_req zone=api burst=20 nodelay;
+                proxy_pass http://music_service/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header Authorization $http_authorization;
+            }
+            location ~* ^/api/(user|playlists)(/|$) {
+                limit_req zone=api burst=20 nodelay;
+                proxy_pass http://music_service/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header Authorization $http_authorization;
+            }
+            location /api/stream/ {
+                limit_req zone=api burst=30 nodelay;
+                proxy_pass http://music_service/;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+                proxy_set_header Authorization $http_authorization;
+            }
+            location /ws {
+                proxy_pass http://music_service/ws;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade $http_upgrade;
+                proxy_set_header Connection "Upgrade";
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+            location /search {
+                limit_req zone=api burst=20 nodelay;
+                proxy_pass http://music_service/search;
+                proxy_set_header Host $host;
+                proxy_set_header X-Real-IP $remote_addr;
+                proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto $scheme;
+            }
+            location /health { access_log off; return 200 "healthy\n"; add_header Content-Type text/plain; }
+        }
+    }

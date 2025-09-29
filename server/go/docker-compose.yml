@@ -1,0 +1,45 @@
+version: '3.8'
+
+services:
+  music-api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - MONGO_URI=mongodb://mongo:27017
+      - REDIS_ADDR=redis:6379
+      - JWT_SECRET=your-jwt-secret-key
+      - JAMENDO_API_KEY=be6cb53f
+      - JAMENDO_CLIENT_SECRET=94b8586b8053ee3e2bb1ff3606e0e7d5
+      - PORT=8080
+    depends_on:
+      - mongo
+      - redis
+    networks:
+      - gruvit-network
+
+  mongo:
+    image: mongo:7.0
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    networks:
+      - gruvit-network
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - gruvit-network
+
+volumes:
+  mongo_data:
+  redis_data:
+
+networks:
+  gruvit-network:
+    driver: bridge

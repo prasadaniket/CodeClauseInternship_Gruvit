@@ -1,0 +1,69 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: java-auth-service
+  namespace: gruvit
+  labels:
+    app: java-auth-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: java-auth-service
+  template:
+    metadata:
+      labels:
+        app: java-auth-service
+    spec:
+      containers:
+      - name: java-auth-service
+        image: gruvit/java-auth-service:latest
+        ports:
+        - containerPort: 8080
+        env:
+        - name: SPRING_PROFILES_ACTIVE
+          value: "prod"
+        - name: MONGODB_URI
+          valueFrom:
+            configMapKeyRef:
+              name: gruvit-config
+              key: MONGO_URI
+        - name: JWT_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: gruvit-secrets
+              key: JWT_SECRET
+        - name: JWT_EXPIRATION
+          value: "86400000"
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /actuator/health
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: java-service
+  namespace: gruvit
+spec:
+  selector:
+    app: java-auth-service
+  ports:
+  - port: 8080
+    targetPort: 8080
+  type: ClusterIP

@@ -1,0 +1,203 @@
+package main
+
+import (
+	"context"
+	"log"
+	"os"
+
+	"gruvit/server/go/handlers"
+	"gruvit/server/go/middleware"
+	"gruvit/server/go/services"
+
+	"github.com/gin-contrib/cors"
+	"github.com/gin-gonic/gin"
+	"github.com/joho/godotenv"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
+)
+
+func main() {
+	// Load environment variables
+	err := godotenv.Load("config.dev.env")
+	if err != nil {
+		log.Println("No config.dev.env file found")
+	}
+
+	// Set Gin mode based on environment
+	ginMode := os.Getenv("GIN_MODE")
+	if ginMode != "" {
+		gin.SetMode(ginMode)
+	}
+
+	// Connect to MongoDB
+	mongoURI := os.Getenv("MONGO_URI")
+	if mongoURI == "" {
+		log.Fatal("MONGO_URI environment variable is required")
+	}
+
+	client, err := mongo.Connect(context.Background(), options.Client().ApplyURI(mongoURI))
+	if err != nil {
+		log.Fatal("Failed to connect to MongoDB:", err)
+	}
+	defer client.Disconnect(context.Background())
+
+	// Test MongoDB connection
+	err = client.Ping(context.Background(), nil)
+	if err != nil {
+		log.Fatal("Failed to ping MongoDB:", err)
+	}
+	log.Println("Successfully connected to MongoDB")
+
+	db := client.Database("gruvit")
+
+	// Initialize services
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		redisAddr = "localhost:6379"
+	}
+	redisPassword := os.Getenv("REDIS_PASSWORD")
+	redisDB := 0
+
+	// Initialize Redis service (optional)
+	var redisService *services.RedisService
+	redisService = services.NewRedisService(redisAddr, redisPassword, redisDB)
+	defer redisService.Close()
+
+	// Test Redis connection
+	_, err = redisService.GetSearchResults("test")
+	if err != nil && err.Error() != "redis: nil" {
+		log.Printf("Warning: Redis connection test failed: %v", err)
+		log.Println("Server will continue without Redis caching")
+		redisService = services.NewNilRedisService() // Use nil Redis service
+	} else {
+		log.Println("Successfully connected to Redis")
+	}
+
+	jamendoAPIKey := os.Getenv("JAMENDO_API_KEY")
+	jamendoClientSecret := os.Getenv("JAMENDO_CLIENT_SECRET")
+
+	// Validate required API keys
+	if jamendoAPIKey == "" {
+		log.Println("Warning: JAMENDO_API_KEY not configured - Jamendo search will be disabled")
+	}
+
+	externalAPIService := services.NewExternalAPIService(jamendoAPIKey, jamendoClientSecret)
+	playlistService := services.NewPlaylistService(db)
+	cacheService := services.NewCacheService(db)
+
+	// Initialize JWT service first
+	jwtSecret := os.Getenv("JWT_SECRET")
+	if jwtSecret == "" {
+		jwtSecret = "your-secret-key-change-this-in-production" // In production, use a secure secret
+	}
+	jwtService := services.NewJWTService(jwtSecret)
+	authMiddleware := middleware.NewAuthMiddleware(jwtService)
+
+	// Initialize handlers
+	searchHandler := handlers.NewSearchHandler(externalAPIService, redisService)
+	musicSearchHandler := handlers.NewMusicSearchHandler(externalAPIService, redisService, cacheService)
+	streamHandler := handlers.NewStreamHandler(externalAPIService, redisService)
+	playlistHandler := handlers.NewPlaylistHandler(playlistService)
+	authHandler := handlers.NewAuthHandler(jwtService)
+	userHandler := handlers.NewUserHandler(playlistService, cacheService)
+	publicHandler := handlers.NewPublicHandler(playlistService, cacheService)
+
+	// Setup Gin router
+	r := gin.Default()
+
+	// Configure trusted proxies for security
+	r.SetTrustedProxies([]string{"127.0.0.1", "::1"})
+
+	// CORS configuration
+	r.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{"http://localhost:3000", "http://localhost:3001"},
+		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Accept", "Authorization"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
+	}))
+
+	// Health check endpoint
+	r.GET("/health", func(c *gin.Context) {
+		c.JSON(200, gin.H{"status": "ok", "service": "music-api"})
+	})
+
+	// Public endpoints (no auth required)
+	r.GET("/search", searchHandler.SearchTracks)
+
+	// Enhanced music search endpoints
+	r.GET("/music/search", musicSearchHandler.SearchTracks)
+	r.GET("/music/artist", musicSearchHandler.SearchByArtist)
+	r.GET("/music/genre", musicSearchHandler.SearchByGenre)
+	r.GET("/music/popular", musicSearchHandler.GetPopularTracks)
+	r.GET("/music/track/:id", musicSearchHandler.GetTrackDetails)
+	r.GET("/music/stats", musicSearchHandler.GetCacheStats)
+	r.POST("/music/clean-cache", musicSearchHandler.CleanCache)
+
+	// Authentication endpoints (public)
+	auth := r.Group("/auth")
+	{
+		auth.POST("/register", authHandler.Register)
+		auth.POST("/login", authHandler.Login)
+		auth.POST("/refresh", authHandler.RefreshToken)
+		auth.POST("/logout", authHandler.Logout)
+		auth.GET("/validate", authHandler.ValidateToken)
+	}
+
+	// Protected endpoints (auth required)
+	api := r.Group("/api")
+	api.Use(authMiddleware.ValidateJWT())
+	{
+		// Stream endpoints
+		api.GET("/stream/:trackId", streamHandler.GetStreamURL)
+
+		// User profile endpoints
+		api.GET("/profile", authHandler.GetUserProfile)
+		api.PUT("/profile", authHandler.UpdateUserProfile)
+
+		// User analytics and favorites endpoints
+		user := api.Group("/user")
+		{
+			user.GET("/favorites", userHandler.GetUserFavorites)
+			user.GET("/top-artists", userHandler.GetUserTopArtists)
+			user.GET("/top-tracks", userHandler.GetUserTopTracks)
+			user.GET("/followings", userHandler.GetUserFollowings)
+			user.GET("/followers", userHandler.GetUserFollowers)
+			user.POST("/follow/:artistId", userHandler.FollowArtist)
+			user.DELETE("/unfollow/:artistId", userHandler.UnfollowArtist)
+			user.POST("/favorites/:trackId", userHandler.AddToFavorites)
+			user.DELETE("/favorites/:trackId", userHandler.RemoveFromFavorites)
+		}
+
+		// Playlist endpoints
+		playlists := api.Group("/playlists")
+		{
+			playlists.POST("", playlistHandler.CreatePlaylist)
+			playlists.GET("", playlistHandler.GetUserPlaylists)
+			playlists.GET("/:id", playlistHandler.GetPlaylist)
+			playlists.PUT("/:id", playlistHandler.UpdatePlaylist)
+			playlists.DELETE("/:id", playlistHandler.DeletePlaylist)
+			playlists.POST("/:id/tracks", playlistHandler.AddTrackToPlaylist)
+			playlists.DELETE("/:id/tracks", playlistHandler.RemoveTrackFromPlaylist)
+		}
+	}
+
+	// Public playlist endpoints (for public playlists)
+	public := r.Group("/public")
+	public.Use(authMiddleware.OptionalJWT())
+	{
+		public.GET("/playlists", publicHandler.GetPublicPlaylists)
+		public.GET("/playlists/:id", playlistHandler.GetPlaylist)
+	}
+
+	// Start server
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	log.Printf("Starting music API server on port %s", port)
+	if err := r.Run(":" + port); err != nil {
+		log.Fatal("Failed to start server:", err)
+	}
+}
